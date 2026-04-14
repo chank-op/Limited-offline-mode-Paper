@@ -1,0 +1,18 @@
+name: LimitedOfflineMode
+version: '${project.version}'
+main: de.moritxius.limitedofflinemode.LimitedOfflineModePaper
+api-version: '1.21'
+description: Allows specific usernames to join in offline mode while Paper server is in online mode
+authors: [chank_op]
+website: https://github.com/chank-op
+
+commands:
+  lomgroup:
+    description: Manage offline-mode player groups
+    usage: /lomgroup group <add|enable|disable|toggle|list|reload> [group] [players]
+    permission: limitedofflinemode.admin
+
+permissions:
+  limitedofflinemode.admin:
+    description: Access to /lomgroup command
+    default: op
