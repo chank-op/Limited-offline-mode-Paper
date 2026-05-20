@@ -1,23 +1,40 @@
-# LimitedOfflineMode — Paper Plugin
+# LimitedOfflineMode
 
-A Paper plugin that lets specific usernames join an **online-mode server without Mojang authentication** — no proxy, no server mode switch required.
+A Bukkit plugin that lets specific usernames join an **online-mode server without Mojang authentication** — no proxy, no server mode switch required.
 
-> **Forked from** [moritxius-matsuda/LimitedOfflineMode](https://github.com/moritxius-matsuda/LimitedOfflineMode) — original plugin for Velocity & BungeeCord.
-> This fork is a full rewrite targeting Paper directly.
+---
+
+## Compatibility
+
+| Server | Status |
+|--------|--------|
+| Paper 1.21.x | ✅ Supported (native API) |
+| Spigot 1.21.x | ✅ Supported (reflection injection) |
+| Purpur | ✅ Supported |
+| Folia | ✅ Supported |
+| Mohist / Magma | ✅ Supported |
+
+Requires **Java 21+**.
 
 ---
 
 ## How It Works
 
-The plugin injects a Netty handler into every new connection pipeline. When a whitelisted username sends their login packet, the plugin intercepts and cancels the encryption handshake, then calls Paper's internal post-auth method with an offline profile — skipping Mojang auth entirely while keeping all Bukkit login events intact.
+The plugin injects a Netty handler into every new connection pipeline. When a whitelisted username sends their login packet, the plugin intercepts and cancels the encryption handshake, then calls the server's internal post-auth method with an offline profile — skipping Mojang auth entirely while keeping all Bukkit login events intact.
+
+On Paper the injection uses `ChannelInitializeListenerHolder`. On Spigot and other Bukkit-family servers it falls back to reflection-based injection via `ServerConnection`.
+
+---
 
 ## Installation
 
 1. Download the plugin JAR
-2. Place it in your Paper server's `plugins/` folder
+2. Place it in your server's `plugins/` folder
 3. Start the server — config files are generated automatically
 4. Add usernames to `plugins/LimitedOfflineMode/allowed-users.txt`
 5. Restart or run `/lomgroup group reload`
+
+---
 
 ## Configuration
 
@@ -41,6 +58,8 @@ admins|true|Steve,Alex
 testers|false|TestUser
 ```
 
+---
+
 ## Commands
 
 All commands require the `limitedofflinemode.admin` permission (default: op).
@@ -54,14 +73,13 @@ All commands require the `limitedofflinemode.admin` permission (default: op).
 | `/lomgroup group list` | List all groups and their state |
 | `/lomgroup group reload` | Reload config from disk without restart |
 
-## Requirements
-
-- Paper 1.21.x (tested on 26.1.2)
-- Java 21+
+---
 
 ## Metrics
 
 Anonymous usage stats via bStats. Can be disabled in `plugins/bStats/config.yml` on your server.
+
+---
 
 ## ⚠️ Disclaimer
 
@@ -73,4 +91,4 @@ Provided **as is**, without warranty.
 
 ---
 
-[GitHub](https://github.com/chank-op) · [Original Project](https://github.com/moritxius-matsuda/LimitedOfflineMode)
+[GitHub](https://github.com/chank-op)

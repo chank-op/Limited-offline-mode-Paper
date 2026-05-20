@@ -2,7 +2,7 @@ name: LimitedOfflineMode
 version: '${project.version}'
 main: de.moritxius.limitedofflinemode.LimitedOfflineModePaper
 api-version: '1.21'
-description: Allows specific usernames to join in offline mode while Paper server is in online mode
+description: Allows specific usernames to join in offline mode on online-mode Bukkit-family servers (Paper, Spigot, Purpur, and compatible forks)
 authors: [chank_op]
 website: https://github.com/chank-op
 

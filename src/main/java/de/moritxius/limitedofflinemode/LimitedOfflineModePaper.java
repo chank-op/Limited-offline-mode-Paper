@@ -1,6 +1,10 @@
 package de.moritxius.limitedofflinemode;
 
-import io.papermc.paper.network.ChannelInitializeListenerHolder;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelInitializer;
 import org.bstats.bukkit.Metrics;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
@@ -13,21 +17,27 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
 
-@SuppressWarnings("UnstableApiUsage") // ChannelInitializeListenerHolder is @Experimental but stable in practice
+@SuppressWarnings("UnstableApiUsage")
 public class LimitedOfflineModePaper extends JavaPlugin {
 
     private static final int BSTATS_PLUGIN_ID = 29813;
-    private static final String LISTENER_KEY = "login_interceptor";
+    private static final String LISTENER_KEY   = "login_interceptor";
+    private static final String HANDLER_KEY    = "lom_login_interceptor";
+    private static final String SERVER_HANDLER_KEY = "lom_server_init";
 
-    private final Set<String> allowedUsers = new HashSet<>();
-    private final Map<String, Set<String>> playerGroups = new HashMap<>();
-    private final Set<String> enabledGroups = new HashSet<>();
+    private final Set<String>         allowedUsers         = new HashSet<>();
+    private final Map<String, Set<String>> playerGroups    = new HashMap<>();
+    private final Set<String>         enabledGroups        = new HashSet<>();
+    private final List<Channel>       injectedServerChannels = new ArrayList<>();
+
+    private boolean usePaperApi = false;
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -36,50 +46,138 @@ public class LimitedOfflineModePaper extends JavaPlugin {
         printBanner();
         loadAllowedUsers();
         loadPlayerGroups();
-
-        // Inject our handler into every new player connection pipeline.
-        // ChannelInitializeListenerHolder is a stable Paper API available since 1.18.
-        ChannelInitializeListenerHolder.addListener(
-                new NamespacedKey(this, LISTENER_KEY),
-                channel -> channel.pipeline().addBefore(
-                        "packet_handler",
-                        "lom_login_interceptor",
-                        new LoginInterceptor(this))
-        );
-
+        setupChannelInjection();
         new Metrics(this, BSTATS_PLUGIN_ID);
-
         getLogger().info("LimitedOfflineMode enabled — "
                 + allowedUsers.size() + " allowed users, "
                 + playerGroups.size() + " groups.");
     }
 
-    private void printBanner() {
-        String cyan  = ChatColor.AQUA.toString();
-        String green = ChatColor.GREEN.toString();
-        String gold  = ChatColor.GOLD.toString();
-        String bold  = ChatColor.BOLD.toString();
-
-        InputStream is = getResource("ascii-art.txt");
-        if (is != null) {
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    Bukkit.getConsoleSender().sendMessage(cyan + line);
-                }
-            } catch (IOException ignored) {}
-        }
-
-        Bukkit.getConsoleSender().sendMessage(
-                green + bold + "  Plugin by chank_op" +
-                ChatColor.RESET + "  |  " +
-                gold + "https://github.com/chank-op");
-        Bukkit.getConsoleSender().sendMessage("");
-    }
-
     @Override
     public void onDisable() {
-        ChannelInitializeListenerHolder.removeListener(new NamespacedKey(this, LISTENER_KEY));
+        if (usePaperApi) {
+            io.papermc.paper.network.ChannelInitializeListenerHolder
+                    .removeListener(new NamespacedKey(this, LISTENER_KEY));
+        } else {
+            for (Channel ch : injectedServerChannels) {
+                if (ch.pipeline().get(SERVER_HANDLER_KEY) != null) {
+                    ch.pipeline().remove(SERVER_HANDLER_KEY);
+                }
+            }
+            injectedServerChannels.clear();
+        }
+    }
+
+    // ── Channel injection ─────────────────────────────────────────────────────
+
+    private void setupChannelInjection() {
+        if (isPaperServer()) {
+            usePaperApi = true;
+            setupPaperInjection();
+            getLogger().info("[LOM] Using Paper channel injection API.");
+        } else {
+            try {
+                setupSpigotInjection();
+                getLogger().info("[LOM] Using reflection-based channel injection (Spigot/CraftBukkit).");
+            } catch (Exception e) {
+                getLogger().severe("[LOM] Failed to inject channel handler: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private boolean isPaperServer() {
+        try {
+            Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
+            return true;
+        } catch (ClassNotFoundException e) {
+            return false;
+        }
+    }
+
+    private void setupPaperInjection() {
+        io.papermc.paper.network.ChannelInitializeListenerHolder.addListener(
+                new NamespacedKey(this, LISTENER_KEY),
+                channel -> channel.pipeline().addBefore("packet_handler", HANDLER_KEY, new LoginInterceptor(this))
+        );
+    }
+
+    private void setupSpigotInjection() throws Exception {
+        Object craftServer    = Bukkit.getServer();
+        Object minecraftServer = craftServer.getClass().getMethod("getServer").invoke(craftServer);
+
+        Object serverConnection = findFieldByTypeName(minecraftServer, "ServerConnection");
+        if (serverConnection == null) {
+            throw new IllegalStateException("Cannot find ServerConnection on MinecraftServer");
+        }
+
+        List<ChannelFuture> futures = findChannelFutures(serverConnection);
+        if (futures == null || futures.isEmpty()) {
+            throw new IllegalStateException("Cannot find ChannelFuture list in ServerConnection");
+        }
+
+        LimitedOfflineModePaper plugin = this;
+        ChannelInboundHandlerAdapter serverHandler = new ChannelInboundHandlerAdapter() {
+            @Override
+            public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+                if (msg instanceof Channel playerChannel) {
+                    playerChannel.pipeline().addLast(new ChannelInitializer<Channel>() {
+                        @Override
+                        protected void initChannel(Channel ch) {
+                            // Defer until after Minecraft's own ChannelInitializer sets up packet_handler
+                            ch.eventLoop().execute(() -> {
+                                if (ch.isActive()
+                                        && ch.pipeline().get("packet_handler") != null
+                                        && ch.pipeline().get(HANDLER_KEY) == null) {
+                                    ch.pipeline().addBefore("packet_handler", HANDLER_KEY, new LoginInterceptor(plugin));
+                                }
+                            });
+                        }
+                    });
+                }
+                super.channelRead(ctx, msg);
+            }
+        };
+
+        for (ChannelFuture future : futures) {
+            Channel serverChannel = future.channel();
+            serverChannel.pipeline().addFirst(SERVER_HANDLER_KEY, serverHandler);
+            injectedServerChannels.add(serverChannel);
+        }
+    }
+
+    // ── Reflection helpers for Spigot injection ───────────────────────────────
+
+    private static Object findFieldByTypeName(Object obj, String simpleTypeName) {
+        Class<?> clazz = obj.getClass();
+        while (clazz != null) {
+            for (Field f : clazz.getDeclaredFields()) {
+                if (f.getType().getSimpleName().equals(simpleTypeName)) {
+                    f.setAccessible(true);
+                    try { return f.get(obj); } catch (Exception ignored) {}
+                }
+            }
+            clazz = clazz.getSuperclass();
+        }
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<ChannelFuture> findChannelFutures(Object serverConnection) throws Exception {
+        Class<?> clazz = serverConnection.getClass();
+        while (clazz != null) {
+            for (Field f : clazz.getDeclaredFields()) {
+                if (List.class.isAssignableFrom(f.getType())) {
+                    f.setAccessible(true);
+                    List<?> list = (List<?>) f.get(serverConnection);
+                    if (list != null && !list.isEmpty() && list.get(0) instanceof ChannelFuture) {
+                        return (List<ChannelFuture>) list;
+                    }
+                }
+            }
+            clazz = clazz.getSuperclass();
+        }
+        return null;
     }
 
     // ── Auth check (called by LoginInterceptor) ───────────────────────────────
@@ -184,7 +282,7 @@ public class LimitedOfflineModePaper extends JavaPlugin {
             return true;
         }
 
-        String action = args[1].toLowerCase(Locale.ROOT);
+        String action    = args[1].toLowerCase(Locale.ROOT);
         String groupName = args.length > 2 ? normalize(args[2]) : "";
 
         switch (action) {
@@ -236,5 +334,28 @@ public class LimitedOfflineModePaper extends JavaPlugin {
 
     private String normalize(String s) {
         return s == null ? "" : s.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private void printBanner() {
+        String cyan  = ChatColor.AQUA.toString();
+        String green = ChatColor.GREEN.toString();
+        String gold  = ChatColor.GOLD.toString();
+        String bold  = ChatColor.BOLD.toString();
+
+        InputStream is = getResource("ascii-art.txt");
+        if (is != null) {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    Bukkit.getConsoleSender().sendMessage(cyan + line);
+                }
+            } catch (IOException ignored) {}
+        }
+
+        Bukkit.getConsoleSender().sendMessage(
+                green + bold + "  Plugin by chank_op" +
+                ChatColor.RESET + "  |  " +
+                gold + "https://github.com/chank-op");
+        Bukkit.getConsoleSender().sendMessage("");
     }
 }
