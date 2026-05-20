@@ -37,16 +37,7 @@
             <scope>provided</scope>
         </dependency>
 
-        <!-- Paper 26.1.2 server jar — provides ChannelInitializeListenerHolder
-             (not in the API artifact above, but present on any Paper 26.x server) -->
-        <dependency>
-            <groupId>io.papermc.paper</groupId>
-            <artifactId>paper-server</artifactId>
-            <version>26.1.2</version>
-            <scope>provided</scope>
-        </dependency>
-
-        <!-- Netty — bundled inside the Paper server JAR at runtime -->
+        <!-- Netty — bundled inside the server JAR at runtime -->
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-all</artifactId>
