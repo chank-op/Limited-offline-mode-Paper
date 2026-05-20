@@ -24,7 +24,6 @@ import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
 
-@SuppressWarnings("UnstableApiUsage")
 public class LimitedOfflineModePaper extends JavaPlugin {
 
     private static final int BSTATS_PLUGIN_ID = 29813;
@@ -56,8 +55,13 @@ public class LimitedOfflineModePaper extends JavaPlugin {
     @Override
     public void onDisable() {
         if (usePaperApi) {
-            io.papermc.paper.network.ChannelInitializeListenerHolder
-                    .removeListener(new NamespacedKey(this, LISTENER_KEY));
+            try {
+                Class<?> holder = Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
+                holder.getMethod("removeListener", NamespacedKey.class)
+                      .invoke(null, new NamespacedKey(this, LISTENER_KEY));
+            } catch (Exception e) {
+                getLogger().warning("[LOM] Failed to remove Paper channel listener: " + e.getMessage());
+            }
         } else {
             for (Channel ch : injectedServerChannels) {
                 if (ch.pipeline().get(SERVER_HANDLER_KEY) != null) {
@@ -72,10 +76,15 @@ public class LimitedOfflineModePaper extends JavaPlugin {
 
     private void setupChannelInjection() {
         if (isPaperServer()) {
-            usePaperApi = true;
-            setupPaperInjection();
-            getLogger().info("[LOM] Using Paper channel injection API.");
-        } else {
+            try {
+                setupPaperInjection();
+                usePaperApi = true;
+                getLogger().info("[LOM] Using Paper channel injection API.");
+            } catch (Exception e) {
+                getLogger().warning("[LOM] Paper injection failed, falling back to Spigot: " + e.getMessage());
+            }
+        }
+        if (!usePaperApi) {
             try {
                 setupSpigotInjection();
                 getLogger().info("[LOM] Using reflection-based channel injection (Spigot/CraftBukkit).");
@@ -95,11 +104,13 @@ public class LimitedOfflineModePaper extends JavaPlugin {
         }
     }
 
-    private void setupPaperInjection() {
-        io.papermc.paper.network.ChannelInitializeListenerHolder.addListener(
-                new NamespacedKey(this, LISTENER_KEY),
-                channel -> channel.pipeline().addBefore("packet_handler", HANDLER_KEY, new LoginInterceptor(this))
-        );
+    private void setupPaperInjection() throws Exception {
+        Class<?> holder = Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
+        NamespacedKey key = new NamespacedKey(this, LISTENER_KEY);
+        java.util.function.Consumer<Channel> listener =
+                channel -> channel.pipeline().addBefore("packet_handler", HANDLER_KEY, new LoginInterceptor(this));
+        holder.getMethod("addListener", NamespacedKey.class, java.util.function.Consumer.class)
+              .invoke(null, key, listener);
     }
 
     private void setupSpigotInjection() throws Exception {
