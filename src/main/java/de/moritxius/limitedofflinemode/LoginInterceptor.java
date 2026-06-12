@@ -70,7 +70,7 @@ public class LoginInterceptor extends ChannelDuplexHandler {
                 String message = extractChatMessage(msg);
                 if (message != null && !message.isBlank()) {
                     String username = offlineUsername;
-                    plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    LimitedOfflineModePaper.scheduleTask(plugin, () -> {
                         Player player = plugin.getServer().getPlayer(username);
                         if (player != null) firePlayerChat(player, message);
                     });
@@ -96,10 +96,10 @@ public class LoginInterceptor extends ChannelDuplexHandler {
                 // Swallow EncryptionRequest — client must never receive it
                 promise.setSuccess();
 
-                // Must run on the main server thread — verifyLoginAndFinishConnectionSetup
+                // Must run on the global region thread — verifyLoginAndFinishConnectionSetup
                 // fires Bukkit events (ProfileWhitelistVerifyEvent, AsyncPlayerPreLoginEvent)
-                // which require the primary thread.
-                plugin.getServer().getScheduler().runTask(plugin,
+                // which require a proper thread context.
+                LimitedOfflineModePaper.scheduleTask(plugin,
                         () -> injectOfflineLogin(ctx.channel(), username));
                 return;
             }

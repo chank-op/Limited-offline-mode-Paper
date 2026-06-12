@@ -56,9 +56,12 @@ public class LimitedOfflineModePaper extends JavaPlugin {
     public void onDisable() {
         if (usePaperApi) {
             try {
-                Class<?> holder = Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
-                holder.getMethod("removeListener", NamespacedKey.class)
-                      .invoke(null, new NamespacedKey(this, LISTENER_KEY));
+                Class<?> holder  = Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
+                Class<?> keyIf   = Class.forName("net.kyori.adventure.key.Key");
+                // Use getDeclaredMethod so Folia path is also cleaned up correctly
+                java.lang.reflect.Method remover = holder.getDeclaredMethod("removeListener", keyIf);
+                remover.setAccessible(true);
+                remover.invoke(null, new NamespacedKey(this, LISTENER_KEY));
             } catch (Exception e) {
                 getLogger().warning("[LOM] Failed to remove Paper channel listener: " + e.getMessage());
             }
@@ -75,15 +78,30 @@ public class LimitedOfflineModePaper extends JavaPlugin {
     // ── Channel injection ─────────────────────────────────────────────────────
 
     private void setupChannelInjection() {
+        // ── Folia — use getDeclaredMethod (finds package‑private methods too) ──
+        if (isFoliaServer()) {
+            try {
+                setupPaperInjection(true);
+                getLogger().info("[LOM] Using Folia channel injection.");
+                return;
+            } catch (Exception e) {
+                getLogger().warning("[LOM] Folia injection failed, falling back: " + e.getMessage());
+            }
+        }
+
+        // ── Paper — public ChannelInitializeListenerHolder API ──
         if (isPaperServer()) {
             try {
-                setupPaperInjection();
+                setupPaperInjection(false);
                 usePaperApi = true;
                 getLogger().info("[LOM] Using Paper channel injection API.");
+                return;
             } catch (Exception e) {
                 getLogger().warning("[LOM] Paper injection failed, falling back to Spigot: " + e.getMessage());
             }
         }
+
+        // ── Spigot / CraftBukkit — reflection-based ──
         if (!usePaperApi) {
             try {
                 setupSpigotInjection();
@@ -95,6 +113,41 @@ public class LimitedOfflineModePaper extends JavaPlugin {
         }
     }
 
+    /** Detects Folia — the regionised multithreading fork of Paper. */
+    public static boolean isFoliaServer() {
+        try {
+            Class.forName("io.papermc.paper.threadedregions.TickRegionScheduler");
+            return true;
+        } catch (ClassNotFoundException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Safely schedules a task on the "main" or global region thread.
+     * <p>On Folia {@code Bukkit.getScheduler().runTask()} throws
+     * {@code UnsupportedOperationException}, so we use
+     * {@code Bukkit.getGlobalRegionScheduler().run()} instead.
+     * On Spigot/CraftBukkit we fall back to the legacy scheduler.</p>
+     */
+    public static void scheduleTask(JavaPlugin plugin, Runnable task) {
+        if (isFoliaServer()) {
+            try {
+                // GlobalRegionScheduler#run(Plugin, Consumer<ScheduledTask>)
+                Object globalScheduler = Bukkit.class.getMethod("getGlobalRegionScheduler").invoke(null);
+                globalScheduler.getClass().getMethod("run",
+                                org.bukkit.plugin.Plugin.class,
+                                java.util.function.Consumer.class)
+                        .invoke(globalScheduler, plugin,
+                                (java.util.function.Consumer<Object>) scheduledTask -> task.run());
+                return;
+            } catch (Exception ignored) {
+                // fall through to BukkitScheduler
+            }
+        }
+        plugin.getServer().getScheduler().runTask(plugin, task);
+    }
+
     private boolean isPaperServer() {
         try {
             Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
@@ -104,20 +157,49 @@ public class LimitedOfflineModePaper extends JavaPlugin {
         }
     }
 
-    private void setupPaperInjection() throws Exception {
-        Class<?> holder = Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
-        NamespacedKey key = new NamespacedKey(this, LISTENER_KEY);
-        java.util.function.Consumer<Channel> listener =
-                channel -> channel.pipeline().addBefore("packet_handler", HANDLER_KEY, new LoginInterceptor(this));
-        holder.getMethod("addListener", NamespacedKey.class, java.util.function.Consumer.class)
-              .invoke(null, key, listener);
+    /**
+     * Registers our channel listener via {@code ChannelInitializeListenerHolder}.
+     *
+     * @param useDeclaredMethod if {@code true} uses {@code getDeclaredMethod}+{@code setAccessible}
+     *                          (needed on Folia where the method may be package‑private);
+     *                          otherwise uses the standard public-only {@code getMethod}.
+     */
+    private void setupPaperInjection(boolean useDeclaredMethod) throws Exception {
+        Class<?> holder     = Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
+        Class<?> listenerIf = Class.forName("io.papermc.paper.network.ChannelInitializeListener");
+        // The addListener method signature uses net.kyori.adventure.key.Key, NOT NamespacedKey!
+        Class<?> keyIf      = Class.forName("net.kyori.adventure.key.Key");
+        NamespacedKey key   = new NamespacedKey(this, LISTENER_KEY);
+
+        Object listener = java.lang.reflect.Proxy.newProxyInstance(
+                getClass().getClassLoader(),
+                new Class<?>[]{listenerIf},
+                (proxy, method, args) -> {
+                    if (method.getDeclaringClass() == Object.class) {
+                        return method.invoke(this, args);
+                    }
+                    Channel ch = (Channel) args[0];
+                    ch.pipeline().addBefore("packet_handler", HANDLER_KEY, new LoginInterceptor(this));
+                    return null;
+                });
+
+        java.lang.reflect.Method addListener;
+        if (useDeclaredMethod) {
+            // Folia path — the method may be non‑public
+            addListener = holder.getDeclaredMethod("addListener", keyIf, listenerIf);
+            addListener.setAccessible(true);
+        } else {
+            addListener = holder.getMethod("addListener", keyIf, listenerIf);
+        }
+        addListener.invoke(null, key, listener);
     }
 
     private void setupSpigotInjection() throws Exception {
         Object craftServer    = Bukkit.getServer();
         Object minecraftServer = craftServer.getClass().getMethod("getServer").invoke(craftServer);
 
-        Object serverConnection = findFieldByTypeName(minecraftServer, "ServerConnection");
+        Object serverConnection = findFieldFlexible(minecraftServer, "ServerConnection",
+                "serverConnection", "connection", "listeningChannels");
         if (serverConnection == null) {
             throw new IllegalStateException("Cannot find ServerConnection on MinecraftServer");
         }
@@ -159,11 +241,43 @@ public class LimitedOfflineModePaper extends JavaPlugin {
 
     // ── Reflection helpers for Spigot injection ───────────────────────────────
 
-    private static Object findFieldByTypeName(Object obj, String simpleTypeName) {
+    /** Tries multiple strategies to locate a field on {@code obj}.
+     *  <ol>
+     *   <li>By type simple name (e.g. {@code "ServerConnection"})
+     *   <li>By exact field name ({@code fieldNames} in priority order)
+     *   <li>Scan all fields for one whose type simple name contains {@code typeName}
+     *  </ol> */
+    private static Object findFieldFlexible(Object obj, String typeName, String... fieldNames) {
+        // 1) Exact type match (original behaviour)
         Class<?> clazz = obj.getClass();
         while (clazz != null) {
             for (Field f : clazz.getDeclaredFields()) {
-                if (f.getType().getSimpleName().equals(simpleTypeName)) {
+                if (f.getType().getSimpleName().equals(typeName)) {
+                    f.setAccessible(true);
+                    try { return f.get(obj); } catch (Exception ignored) {}
+                }
+            }
+            clazz = clazz.getSuperclass();
+        }
+
+        // 2) By field name
+        clazz = obj.getClass();
+        while (clazz != null) {
+            for (String name : fieldNames) {
+                try {
+                    Field f = clazz.getDeclaredField(name);
+                    f.setAccessible(true);
+                    return f.get(obj);
+                } catch (NoSuchFieldException | IllegalAccessException ignored) {}
+            }
+            clazz = clazz.getSuperclass();
+        }
+
+        // 3) Fuzzy type name (contains)
+        clazz = obj.getClass();
+        while (clazz != null) {
+            for (Field f : clazz.getDeclaredFields()) {
+                if (f.getType().getSimpleName().contains(typeName)) {
                     f.setAccessible(true);
                     try { return f.get(obj); } catch (Exception ignored) {}
                 }
