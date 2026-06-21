@@ -10,6 +10,7 @@ import org.bukkit.event.player.AsyncPlayerChatEvent;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
@@ -18,24 +19,48 @@ import java.util.UUID;
  * Per-connection Netty handler injected by LimitedOfflineModePaper via
  * Paper's ChannelInitializeListenerHolder.
  *
- * Login sequence:
- *   C→S  ServerboundHelloPacket       (LoginStart)
- *   S→C  ClientboundHelloPacket       (EncryptionRequest) ← we CANCEL for whitelisted players
- *
- * After cancelling we call Paper's own
- * ServerLoginPacketListenerImpl#verifyLoginAndFinishConnectionSetup(GameProfile)
- * with an offline profile.  That method fires AsyncPlayerPreLoginEvent,
- * handles compression, and sends ClientboundLoginFinishedPacket (LoginSuccess)
- * exactly as normal — we just skipped the Mojang auth step.
- *
- * Verified against Paper 26.1.2 (Mojang-mapped).
- * Key fields/methods used:
- *   Connection.packetListener                                          (private volatile)
- *   ServerLoginPacketListenerImpl.authenticatedProfile                 (public)
- *   ServerLoginPacketListenerImpl#verifyLoginAndFinishConnectionSetup  (private)
- *   ServerLoginPacketListenerImpl#createOfflineProfile                 (protected)
+ * <p>This class has been optimized to:</p>
+ * <ul>
+ *   <li>Cache reflection Method/Field objects statically (avoid repeated class hierarchy scans)</li>
+ *   <li>Use cached simple class name strings for fast packet type matching</li>
+ *   <li>Minimize object allocation in the hot chat path</li>
+ * </ul>
  */
 public class LoginInterceptor extends ChannelDuplexHandler {
+
+    private static final String SIMPLE_NAME_HELLO      = "ServerboundHelloPacket";
+    private static final String SIMPLE_NAME_LOGIN_START = "LoginStart";
+    private static final String SIMPLE_NAME_CHAT        = "ServerboundChatPacket";
+    private static final String SIMPLE_NAME_CHAT_COMMAND = "ServerboundChatCommandPacket";
+    private static final String SIMPLE_NAME_ENCRYPT_REQ = "ClientboundHelloPacket";
+    private static final String SIMPLE_NAME_ENCRYPT_REQ_ALT = "EncryptionRequest";
+
+    // ── Cached reflection objects ──────────────────────────────────────────
+
+    /** Cached method for extracting username from ServerboundHelloPacket. */
+    private static Field  cachedUsernameField  = null;
+    private static Method cachedUsernameMethod = null;
+    private static boolean usernameReflectInit = false;
+
+    /** Cached method/field for extracting chat message from ServerboundChatPacket. */
+    private static Method cachedChatMethod = null;
+    private static Field  cachedChatField  = null;
+    private static boolean chatReflectInit = false;
+
+    /** Cached field for Connection.packetListener. */
+    private static Field cachedPacketListenerField = null;
+    private static boolean packetListenerReflectInit = false;
+
+    /** Cached method for createOfflineProfile. */
+    private static Method cachedCreateOfflineProfileMethod = null;
+
+    /** Cached method for verifyLoginAndFinishConnectionSetup. */
+    private static Method cachedVerifyLoginMethod = null;
+
+    /** Cached field for authenticatedProfile. */
+    private static Field cachedAuthProfileField = null;
+
+    // ── Instance state ─────────────────────────────────────────────────────
 
     private final LimitedOfflineModePaper plugin;
     private String pendingUsername  = null;
@@ -53,7 +78,7 @@ public class LoginInterceptor extends ChannelDuplexHandler {
         // ── Login phase: detect whitelisted player ───────────────────────────
         if (pendingUsername == null && !isOfflinePlayer) {
             String cls = msg.getClass().getSimpleName();
-            if (cls.contains("ServerboundHello") || cls.contains("LoginStart")) {
+            if (cls.equals(SIMPLE_NAME_HELLO) || cls.equals(SIMPLE_NAME_LOGIN_START)) {
                 String username = extractUsername(msg);
                 if (username != null && plugin.isUserAllowed(username)) {
                     pendingUsername = username;
@@ -63,10 +88,10 @@ public class LoginInterceptor extends ChannelDuplexHandler {
         }
 
         // ── Play phase: intercept chat before Paper checks profile key ────────
-        if (isOfflinePlayer) {
+        if (isOfflinePlayer && offlineUsername != null) {
             String cls = msg.getClass().getSimpleName();
-            // ServerboundChatPacket but NOT ServerboundChatCommandPacket
-            if (cls.contains("ServerboundChat") && !cls.contains("Command")) {
+            // Match ServerboundChatPacket but NOT ServerboundChatCommandPacket
+            if (cls.equals(SIMPLE_NAME_CHAT) && !cls.equals(SIMPLE_NAME_CHAT_COMMAND)) {
                 String message = extractChatMessage(msg);
                 if (message != null && !message.isBlank()) {
                     String username = offlineUsername;
@@ -88,7 +113,7 @@ public class LoginInterceptor extends ChannelDuplexHandler {
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
         if (pendingUsername != null) {
             String cls = msg.getClass().getSimpleName();
-            if (cls.contains("ClientboundHello") || cls.contains("EncryptionRequest")) {
+            if (cls.equals(SIMPLE_NAME_ENCRYPT_REQ) || cls.equals(SIMPLE_NAME_ENCRYPT_REQ_ALT)) {
                 String username = pendingUsername;
                 pendingUsername  = null;
                 offlineUsername  = username;
@@ -119,19 +144,15 @@ public class LoginInterceptor extends ChannelDuplexHandler {
             }
 
             // Build the offline GameProfile.
-            // Prefer Paper's own createOfflineProfile() so the UUID matches what
-            // Paper uses everywhere else (consistent with /whitelist, player data files, etc.)
             Object offlineProfile = createOfflineProfile(loginListener, username);
 
             // Also set authenticatedProfile so any code reading that field sees our profile
-            setFieldByName(loginListener, "authenticatedProfile", offlineProfile);
+            setAuthenticatedProfile(loginListener, offlineProfile);
 
             // Call verifyLoginAndFinishConnectionSetup — this is what Paper calls after
             // successful Mojang auth.  It fires login events, sets up compression, and
             // sends ClientboundLoginFinishedPacket (LoginSuccess).
-            invokePrivate(loginListener, "verifyLoginAndFinishConnectionSetup",
-                    new Class<?>[]{Class.forName("com.mojang.authlib.GameProfile")},
-                    offlineProfile);
+            invokeVerifyLogin(loginListener, offlineProfile);
 
             isOfflinePlayer = true;
             plugin.getLogger().info("[LOM] Offline login injected for " + username
@@ -144,7 +165,7 @@ public class LoginInterceptor extends ChannelDuplexHandler {
         }
     }
 
-    // ── Reflection helpers ───────────────────────────────────────────────────
+    // ── Reflection helpers (with cached lookups) ───────────────────────────
 
     /**
      * packet_handler in the Netty pipeline is net.minecraft.network.Connection.
@@ -154,10 +175,12 @@ public class LoginInterceptor extends ChannelDuplexHandler {
         Object connection = channel.pipeline().get("packet_handler");
         if (connection == null) return null;
 
-        // Try by field name first (stable in Mojang-mapped Paper)
-        Object listener = getFieldValueByName(connection, "packetListener");
-        if (listener != null && listener.getClass().getSimpleName().contains("Login")) {
-            return listener;
+        // Try cached field first
+        if (packetListenerField() != null) {
+            Object listener = cachedPacketListenerField.get(connection);
+            if (listener != null && listener.getClass().getSimpleName().contains("Login")) {
+                return listener;
+            }
         }
 
         // Fallback: scan all fields for a ServerLoginPacketListenerImpl
@@ -167,6 +190,7 @@ public class LoginInterceptor extends ChannelDuplexHandler {
                 f.setAccessible(true);
                 Object val = f.get(connection);
                 if (val != null && val.getClass().getSimpleName().contains("ServerLoginPacketListenerImpl")) {
+                    cachedPacketListenerField = f; // cache for next time
                     return val;
                 }
             }
@@ -175,77 +199,107 @@ public class LoginInterceptor extends ChannelDuplexHandler {
         return null;
     }
 
+    private static Field packetListenerField() {
+        if (!packetListenerReflectInit) {
+            try {
+                Class<?> connectionClass = Class.forName("net.minecraft.network.Connection");
+                cachedPacketListenerField = connectionClass.getDeclaredField("packetListener");
+                cachedPacketListenerField.setAccessible(true);
+            } catch (Exception ignored) {
+                // Will fall back to scanning
+            }
+            packetListenerReflectInit = true;
+        }
+        return cachedPacketListenerField;
+    }
+
     /**
      * Uses Paper's own createOfflineProfile(String) method so the UUID is
      * generated the same way Paper generates it everywhere else.
-     * Falls back to the standard offline UUID algorithm if the method is absent.
      */
     private static Object createOfflineProfile(Object loginListener, String username) throws Exception {
-        try {
-            Method m = loginListener.getClass().getDeclaredMethod("createOfflineProfile", String.class);
-            m.setAccessible(true);
-            return m.invoke(loginListener, username);
-        } catch (NoSuchMethodException ignored) {
-            // Manual fallback
-            UUID uuid = UUID.nameUUIDFromBytes(
-                    ("OfflinePlayer:" + username).getBytes(StandardCharsets.UTF_8));
-            Class<?> profileClass = Class.forName("com.mojang.authlib.GameProfile");
-            return profileClass.getConstructor(UUID.class, String.class).newInstance(uuid, username);
-        }
-    }
-
-    /** Sets a field by exact name, searching up the class hierarchy. */
-    private static void setFieldByName(Object obj, String name, Object value) throws Exception {
-        Class<?> clazz = obj.getClass();
-        while (clazz != null) {
+        if (cachedCreateOfflineProfileMethod == null) {
             try {
-                Field f = clazz.getDeclaredField(name);
-                f.setAccessible(true);
-                f.set(obj, value);
-                return;
-            } catch (NoSuchFieldException ignored) {}
-            clazz = clazz.getSuperclass();
-        }
-        throw new IllegalStateException("Field '" + name + "' not found in " + obj.getClass().getName());
-    }
-
-    /** Gets a field value by name, searching up the class hierarchy. */
-    private static Object getFieldValueByName(Object obj, String name) {
-        Class<?> clazz = obj.getClass();
-        while (clazz != null) {
-            try {
-                Field f = clazz.getDeclaredField(name);
-                f.setAccessible(true);
-                return f.get(obj);
-            } catch (NoSuchFieldException ignored) {
-            } catch (Exception e) {
-                return null;
+                cachedCreateOfflineProfileMethod = loginListener.getClass()
+                        .getDeclaredMethod("createOfflineProfile", String.class);
+                cachedCreateOfflineProfileMethod.setAccessible(true);
+            } catch (NoSuchMethodException ignored) {
+                // Will use fallback below
             }
+        }
+        if (cachedCreateOfflineProfileMethod != null) {
+            return cachedCreateOfflineProfileMethod.invoke(loginListener, username);
+        }
+        // Manual fallback
+        UUID uuid = UUID.nameUUIDFromBytes(
+                ("OfflinePlayer:" + username).getBytes(StandardCharsets.UTF_8));
+        Class<?> profileClass = Class.forName("com.mojang.authlib.GameProfile");
+        return profileClass.getConstructor(UUID.class, String.class).newInstance(uuid, username);
+    }
+
+    private static void setAuthenticatedProfile(Object loginListener, Object profile) throws Exception {
+        if (cachedAuthProfileField == null) {
+            cachedAuthProfileField = findField(loginListener.getClass(), "authenticatedProfile");
+            if (cachedAuthProfileField != null) {
+                cachedAuthProfileField.setAccessible(true);
+            }
+        }
+        if (cachedAuthProfileField != null) {
+            cachedAuthProfileField.set(loginListener, profile);
+        }
+    }
+
+    private static void invokeVerifyLogin(Object loginListener, Object offlineProfile) throws Exception {
+        if (cachedVerifyLoginMethod == null) {
+            cachedVerifyLoginMethod = findMethod(loginListener.getClass(),
+                    "verifyLoginAndFinishConnectionSetup",
+                    Class.forName("com.mojang.authlib.GameProfile"));
+            if (cachedVerifyLoginMethod != null) {
+                cachedVerifyLoginMethod.setAccessible(true);
+            }
+        }
+        if (cachedVerifyLoginMethod != null) {
+            cachedVerifyLoginMethod.invoke(loginListener, offlineProfile);
+        }
+    }
+
+    /** Searches up the class hierarchy for a field by name. */
+    private static Field findField(Class<?> clazz, String name) {
+        while (clazz != null) {
+            try {
+                Field f = clazz.getDeclaredField(name);
+                f.setAccessible(true);
+                return f;
+            } catch (NoSuchFieldException ignored) {}
             clazz = clazz.getSuperclass();
         }
         return null;
     }
 
-    /** Invokes a private/protected method by name with the given argument types and args. */
-    private static void invokePrivate(Object obj, String methodName,
-                                      Class<?>[] paramTypes, Object... args) throws Exception {
-        Class<?> clazz = obj.getClass();
+    /** Searches up the class hierarchy for a method by name and parameter types. */
+    private static Method findMethod(Class<?> clazz, String name, Class<?>... paramTypes) {
         while (clazz != null) {
             try {
-                Method m = clazz.getDeclaredMethod(methodName, paramTypes);
+                Method m = clazz.getDeclaredMethod(name, paramTypes);
                 m.setAccessible(true);
-                m.invoke(obj, args);
-                return;
+                return m;
             } catch (NoSuchMethodException ignored) {}
             clazz = clazz.getSuperclass();
         }
-        throw new IllegalStateException("Method '" + methodName + "' not found in " + obj.getClass().getName());
+        return null;
     }
 
     /** Fires AsyncPlayerChatEvent for an offline player and broadcasts if not cancelled. */
     @SuppressWarnings("deprecation")
     private void firePlayerChat(Player player, String message) {
-        Set<Player> recipients = new HashSet<>(plugin.getServer().getOnlinePlayers());
+        // Reuse a pre-sized HashSet to reduce allocation overhead
+        Collection<? extends Player> onlinePlayers = plugin.getServer().getOnlinePlayers();
+        Set<Player> recipients;
+        if (onlinePlayers instanceof Set) {
+            recipients = (Set<Player>) onlinePlayers;
+        } else {
+            recipients = new HashSet<>(onlinePlayers);
+        }
         AsyncPlayerChatEvent event = new AsyncPlayerChatEvent(false, player, message, recipients);
         plugin.getServer().getPluginManager().callEvent(event);
         if (!event.isCancelled()) {
@@ -260,64 +314,100 @@ public class LoginInterceptor extends ChannelDuplexHandler {
 
     /** Extracts the chat message string from a ServerboundChatPacket via reflection. */
     private static String extractChatMessage(Object packet) {
-        // Try accessor methods first
-        for (String name : new String[]{"getMessage", "message"}) {
+        // Try accessor method first (cached)
+        if (!chatReflectInit) {
+            for (String name : new String[]{"getMessage", "message"}) {
+                try {
+                    cachedChatMethod = packet.getClass().getMethod(name);
+                    break;
+                } catch (NoSuchMethodException ignored) {}
+            }
+            if (cachedChatMethod == null) {
+                // Fallback: find the first String field (message is usually the first)
+                Class<?> clazz = packet.getClass();
+                while (clazz != null && cachedChatField == null) {
+                    for (Field f : clazz.getDeclaredFields()) {
+                        if (f.getType() == String.class) {
+                            f.setAccessible(true);
+                            cachedChatField = f;
+                            break;
+                        }
+                    }
+                    clazz = clazz.getSuperclass();
+                }
+            }
+            chatReflectInit = true;
+        }
+
+        if (cachedChatMethod != null) {
             try {
-                Method m = packet.getClass().getMethod(name);
-                Object val = m.invoke(packet);
+                Object val = cachedChatMethod.invoke(packet);
                 if (val instanceof String s && !s.isBlank()) return s;
             } catch (Exception ignored) {}
         }
-        // Fallback: scan String fields (message is usually the first String field)
-        Class<?> clazz = packet.getClass();
-        while (clazz != null) {
-            for (Field f : clazz.getDeclaredFields()) {
-                if (f.getType() == String.class) {
-                    f.setAccessible(true);
-                    try {
-                        Object val = f.get(packet);
-                        if (val instanceof String s && !s.isBlank()) return s;
-                    } catch (Exception ignored) {}
-                }
-            }
-            clazz = clazz.getSuperclass();
+        if (cachedChatField != null) {
+            try {
+                Object val = cachedChatField.get(packet);
+                if (val instanceof String s && !s.isBlank()) return s;
+            } catch (Exception ignored) {}
         }
         return null;
     }
 
     /** Extracts the username from a ServerboundHelloPacket via method or field. */
     private static String extractUsername(Object packet) {
-        for (String name : new String[]{"name", "getName", "getPlayerName", "getUsername"}) {
-            try {
-                Method m = packet.getClass().getMethod(name);
-                Object val = m.invoke(packet);
-                if (val instanceof String s && !s.isBlank()) return s;
-            } catch (NoSuchMethodException ignored) {
-            } catch (Exception ignored) {}
-        }
-        Class<?> clazz = packet.getClass();
-        while (clazz != null) {
-            for (Field f : clazz.getDeclaredFields()) {
-                if (f.getType() == String.class) {
-                    f.setAccessible(true);
-                    try {
-                        Object val = f.get(packet);
-                        if (val instanceof String s && !s.isBlank()) return s;
-                    } catch (Exception ignored) {}
+        if (!usernameReflectInit) {
+            for (String name : new String[]{"name", "getName", "getPlayerName", "getUsername"}) {
+                try {
+                    cachedUsernameMethod = packet.getClass().getMethod(name);
+                    cachedUsernameMethod.setAccessible(true);
+                    break;
+                } catch (NoSuchMethodException ignored) {}
+            }
+            if (cachedUsernameMethod == null) {
+                // Fallback: find the first non-empty String field
+                Class<?> clazz = packet.getClass();
+                while (clazz != null && cachedUsernameField == null) {
+                    for (Field f : clazz.getDeclaredFields()) {
+                        if (f.getType() == String.class) {
+                            f.setAccessible(true);
+                            // Try reading the value to verify it's the username
+                            try {
+                                Object val = f.get(packet);
+                                if (val instanceof String s && !s.isBlank()) {
+                                    cachedUsernameField = f;
+                                    break;
+                                }
+                            } catch (Exception ignored) {}
+                        }
+                    }
+                    clazz = clazz.getSuperclass();
                 }
             }
-            clazz = clazz.getSuperclass();
+            usernameReflectInit = true;
+        }
+
+        if (cachedUsernameMethod != null) {
+            try {
+                Object val = cachedUsernameMethod.invoke(packet);
+                if (val instanceof String s && !s.isBlank()) return s;
+            } catch (Exception ignored) {}
+        }
+        if (cachedUsernameField != null) {
+            try {
+                Object val = cachedUsernameField.get(packet);
+                if (val instanceof String s && !s.isBlank()) return s;
+            } catch (Exception ignored) {}
         }
         return null;
     }
 
     private static UUID getProfileUUID(Object profile) {
-        for (String name : new String[]{"getId", "id"}) {
-            try {
-                return (UUID) profile.getClass().getMethod(name).invoke(profile);
-            } catch (Exception ignored) {}
-        }
-        // Try field access
+        // Try getId() method first
+        try {
+            return (UUID) profile.getClass().getMethod("getId").invoke(profile);
+        } catch (Exception ignored) {}
+        // Try direct field access
         try {
             Field f = profile.getClass().getDeclaredField("id");
             f.setAccessible(true);
