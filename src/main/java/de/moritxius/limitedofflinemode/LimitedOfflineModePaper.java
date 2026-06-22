@@ -160,10 +160,15 @@ public class LimitedOfflineModePaper extends JavaPlugin {
         if (isFoliaServer()) {
             try {
                 // Player#getScheduler() returns EntityScheduler
-                // EntityScheduler#run(Plugin, Runnable)
+                // EntityScheduler#run(Plugin, Consumer<? super ScheduledTask>, @Nullable Runnable retired)
                 Object entityScheduler = Player.class.getMethod("getScheduler").invoke(player);
-                entityScheduler.getClass().getMethod("run", org.bukkit.plugin.Plugin.class, Runnable.class)
-                        .invoke(entityScheduler, plugin, task);
+                java.util.function.Consumer<Object> consumer = scheduledTask -> task.run();
+                entityScheduler.getClass()
+                        .getMethod("run",
+                                org.bukkit.plugin.Plugin.class,
+                                java.util.function.Consumer.class,
+                                Runnable.class)
+                        .invoke(entityScheduler, plugin, consumer, null);
                 return;
             } catch (Exception ignored) {
                 // fall through — run directly as best-effort
