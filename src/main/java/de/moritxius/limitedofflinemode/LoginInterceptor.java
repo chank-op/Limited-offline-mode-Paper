@@ -95,9 +95,15 @@ public class LoginInterceptor extends ChannelDuplexHandler {
                 String message = extractChatMessage(msg);
                 if (message != null && !message.isBlank()) {
                     String username = offlineUsername;
+                    // Obtain the player reference on a safe thread, then delegate the
+                    // player-affecting work to the player's own region thread (Folia) or
+                    // execute directly on the current thread (non-Folia).
                     LimitedOfflineModePaper.scheduleTask(plugin, () -> {
                         Player player = plugin.getServer().getPlayer(username);
-                        if (player != null) firePlayerChat(player, message);
+                        if (player != null) {
+                            LimitedOfflineModePaper.scheduleOnEntity(plugin, player,
+                                    () -> firePlayerChat(player, message));
+                        }
                     });
                     return; // swallow — never reaches Paper's handleChat()
                 }

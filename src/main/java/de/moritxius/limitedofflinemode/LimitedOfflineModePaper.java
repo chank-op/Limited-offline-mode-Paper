@@ -9,6 +9,7 @@ import org.bstats.bukkit.Metrics;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.NamespacedKey;
+import org.bukkit.entity.Player;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -146,6 +147,29 @@ public class LimitedOfflineModePaper extends JavaPlugin {
             }
         }
         plugin.getServer().getScheduler().runTask(plugin, task);
+    }
+
+    /**
+     * Schedules a task on the player's owning region thread (Folia) or runs it
+     * directly on the current thread (non-Folia, assumed to be main/server thread).
+     * <p>This is the correct way to interact with a Player on Folia — using
+     * {@link #scheduleTask(JavaPlugin, Runnable)} (which uses GlobalRegionScheduler)
+     * for per-player operations violates thread-context rules.</p>
+     */
+    public static void scheduleOnEntity(JavaPlugin plugin, Player player, Runnable task) {
+        if (isFoliaServer()) {
+            try {
+                // Player#getScheduler() returns EntityScheduler
+                // EntityScheduler#run(Plugin, Runnable)
+                Object entityScheduler = Player.class.getMethod("getScheduler").invoke(player);
+                entityScheduler.getClass().getMethod("run", org.bukkit.plugin.Plugin.class, Runnable.class)
+                        .invoke(entityScheduler, plugin, task);
+                return;
+            } catch (Exception ignored) {
+                // fall through — run directly as best-effort
+            }
+        }
+        task.run();
     }
 
     private boolean isPaperServer() {
