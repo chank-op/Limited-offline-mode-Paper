@@ -40,16 +40,16 @@ public class LoginInterceptor extends ChannelDuplexHandler {
     /** Cached method for extracting username from ServerboundHelloPacket. */
     private static Field  cachedUsernameField  = null;
     private static Method cachedUsernameMethod = null;
-    private static boolean usernameReflectInit = false;
+    private static volatile boolean usernameReflectInit = false;
 
     /** Cached method/field for extracting chat message from ServerboundChatPacket. */
     private static Method cachedChatMethod = null;
     private static Field  cachedChatField  = null;
-    private static boolean chatReflectInit = false;
+    private static volatile boolean chatReflectInit = false;
 
     /** Cached field for Connection.packetListener. */
     private static Field cachedPacketListenerField = null;
-    private static boolean packetListenerReflectInit = false;
+    private static volatile boolean packetListenerReflectInit = false;
 
     /** Cached method for createOfflineProfile. */
     private static Method cachedCreateOfflineProfileMethod = null;
@@ -207,14 +207,18 @@ public class LoginInterceptor extends ChannelDuplexHandler {
 
     private static Field packetListenerField() {
         if (!packetListenerReflectInit) {
-            try {
-                Class<?> connectionClass = Class.forName("net.minecraft.network.Connection");
-                cachedPacketListenerField = connectionClass.getDeclaredField("packetListener");
-                cachedPacketListenerField.setAccessible(true);
-            } catch (Exception ignored) {
-                // Will fall back to scanning
+            synchronized (LoginInterceptor.class) {
+                if (!packetListenerReflectInit) {
+                    try {
+                        Class<?> connectionClass = Class.forName("net.minecraft.network.Connection");
+                        cachedPacketListenerField = connectionClass.getDeclaredField("packetListener");
+                        cachedPacketListenerField.setAccessible(true);
+                    } catch (Exception ignored) {
+                        // Will fall back to scanning
+                    }
+                    packetListenerReflectInit = true;
+                }
             }
-            packetListenerReflectInit = true;
         }
         return cachedPacketListenerField;
     }
@@ -318,32 +322,41 @@ public class LoginInterceptor extends ChannelDuplexHandler {
         }
     }
 
-    /** Extracts the chat message string from a ServerboundChatPacket via reflection. */
-    private static String extractChatMessage(Object packet) {
-        // Try accessor method first (cached)
+    /** Ensures the chat-message reflection lookup is performed exactly once. */
+    private static void ensureChatReflectInit(Object packet) {
         if (!chatReflectInit) {
-            for (String name : new String[]{"getMessage", "message"}) {
-                try {
-                    cachedChatMethod = packet.getClass().getMethod(name);
-                    break;
-                } catch (NoSuchMethodException ignored) {}
-            }
-            if (cachedChatMethod == null) {
-                // Fallback: find the first String field (message is usually the first)
-                Class<?> clazz = packet.getClass();
-                while (clazz != null && cachedChatField == null) {
-                    for (Field f : clazz.getDeclaredFields()) {
-                        if (f.getType() == String.class) {
-                            f.setAccessible(true);
-                            cachedChatField = f;
+            synchronized (LoginInterceptor.class) {
+                if (!chatReflectInit) {
+                    // Try accessor method first
+                    for (String name : new String[]{"getMessage", "message"}) {
+                        try {
+                            cachedChatMethod = packet.getClass().getMethod(name);
                             break;
+                        } catch (NoSuchMethodException ignored) {}
+                    }
+                    if (cachedChatMethod == null) {
+                        // Fallback: find the first String field
+                        Class<?> clazz = packet.getClass();
+                        while (clazz != null && cachedChatField == null) {
+                            for (Field f : clazz.getDeclaredFields()) {
+                                if (f.getType() == String.class) {
+                                    f.setAccessible(true);
+                                    cachedChatField = f;
+                                    break;
+                                }
+                            }
+                            clazz = clazz.getSuperclass();
                         }
                     }
-                    clazz = clazz.getSuperclass();
+                    chatReflectInit = true;
                 }
             }
-            chatReflectInit = true;
         }
+    }
+
+    /** Extracts the chat message string from a ServerboundChatPacket via reflection. */
+    private static String extractChatMessage(Object packet) {
+        ensureChatReflectInit(packet);
 
         if (cachedChatMethod != null) {
             try {
@@ -360,38 +373,47 @@ public class LoginInterceptor extends ChannelDuplexHandler {
         return null;
     }
 
-    /** Extracts the username from a ServerboundHelloPacket via method or field. */
-    private static String extractUsername(Object packet) {
+    /** Ensures the username reflection lookup is performed exactly once. */
+    private static void ensureUsernameReflectInit(Object packet) {
         if (!usernameReflectInit) {
-            for (String name : new String[]{"name", "getName", "getPlayerName", "getUsername"}) {
-                try {
-                    cachedUsernameMethod = packet.getClass().getMethod(name);
-                    cachedUsernameMethod.setAccessible(true);
-                    break;
-                } catch (NoSuchMethodException ignored) {}
-            }
-            if (cachedUsernameMethod == null) {
-                // Fallback: find the first non-empty String field
-                Class<?> clazz = packet.getClass();
-                while (clazz != null && cachedUsernameField == null) {
-                    for (Field f : clazz.getDeclaredFields()) {
-                        if (f.getType() == String.class) {
-                            f.setAccessible(true);
-                            // Try reading the value to verify it's the username
-                            try {
-                                Object val = f.get(packet);
-                                if (val instanceof String s && !s.isBlank()) {
-                                    cachedUsernameField = f;
-                                    break;
+            synchronized (LoginInterceptor.class) {
+                if (!usernameReflectInit) {
+                    // Try accessor methods first
+                    for (String name : new String[]{"name", "getName", "getPlayerName", "getUsername"}) {
+                        try {
+                            cachedUsernameMethod = packet.getClass().getMethod(name);
+                            cachedUsernameMethod.setAccessible(true);
+                            break;
+                        } catch (NoSuchMethodException ignored) {}
+                    }
+                    if (cachedUsernameMethod == null) {
+                        // Fallback: find the first non-empty String field
+                        Class<?> clazz = packet.getClass();
+                        while (clazz != null && cachedUsernameField == null) {
+                            for (Field f : clazz.getDeclaredFields()) {
+                                if (f.getType() == String.class) {
+                                    f.setAccessible(true);
+                                    try {
+                                        Object val = f.get(packet);
+                                        if (val instanceof String s && !s.isBlank()) {
+                                            cachedUsernameField = f;
+                                            break;
+                                        }
+                                    } catch (Exception ignored) {}
                                 }
-                            } catch (Exception ignored) {}
+                            }
+                            clazz = clazz.getSuperclass();
                         }
                     }
-                    clazz = clazz.getSuperclass();
+                    usernameReflectInit = true;
                 }
             }
-            usernameReflectInit = true;
         }
+    }
+
+    /** Extracts the username from a ServerboundHelloPacket via method or field. */
+    private static String extractUsername(Object packet) {
+        ensureUsernameReflectInit(packet);
 
         if (cachedUsernameMethod != null) {
             try {
