@@ -8,7 +8,6 @@ import io.netty.channel.ChannelInitializer;
 import org.bstats.bukkit.Metrics;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
-import org.bukkit.NamespacedKey;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -18,6 +17,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -56,9 +56,9 @@ public class LimitedOfflineModePaper extends JavaPlugin {
     public void onDisable() {
         if (usePaperApi) {
             try {
-                Class<?> holder = Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
-                holder.getMethod("removeListener", NamespacedKey.class)
-                      .invoke(null, new NamespacedKey(this, LISTENER_KEY));
+                Class<?> holder  = Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
+                Class<?> keyType = Class.forName("net.kyori.adventure.key.Key");
+                holder.getMethod("removeListener", keyType).invoke(null, adventureKey());
             } catch (Exception e) {
                 getLogger().warning("[LOM] Failed to remove Paper channel listener: " + e.getMessage());
             }
@@ -81,7 +81,9 @@ public class LimitedOfflineModePaper extends JavaPlugin {
                 usePaperApi = true;
                 getLogger().info("[LOM] Using Paper channel injection API.");
             } catch (Exception e) {
-                getLogger().warning("[LOM] Paper injection failed, falling back to Spigot: " + e.getMessage());
+                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                getLogger().warning("[LOM] Paper injection failed, falling back to Spigot: "
+                        + cause.getClass().getSimpleName() + ": " + cause.getMessage());
             }
         }
         if (!usePaperApi) {
@@ -90,6 +92,7 @@ public class LimitedOfflineModePaper extends JavaPlugin {
                 getLogger().info("[LOM] Using reflection-based channel injection (Spigot/CraftBukkit).");
             } catch (Exception e) {
                 getLogger().severe("[LOM] Failed to inject channel handler: " + e.getMessage());
+                getLogger().severe("[LOM] Plugin is INACTIVE — offline players will still be rejected by Mojang auth.");
                 e.printStackTrace();
             }
         }
@@ -104,22 +107,57 @@ public class LimitedOfflineModePaper extends JavaPlugin {
         }
     }
 
+    /**
+     * Paper's signature is {@code addListener(net.kyori.adventure.key.Key,
+     * io.papermc.paper.network.ChannelInitializeListener)} — neither type is in the
+     * public paper-api, so the key is built and the listener proxied reflectively.
+     */
     private void setupPaperInjection() throws Exception {
-        Class<?> holder = Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
-        NamespacedKey key = new NamespacedKey(this, LISTENER_KEY);
-        java.util.function.Consumer<Channel> listener =
-                channel -> channel.pipeline().addBefore("packet_handler", HANDLER_KEY, new LoginInterceptor(this));
-        holder.getMethod("addListener", NamespacedKey.class, java.util.function.Consumer.class)
-              .invoke(null, key, listener);
+        Class<?> holder       = Class.forName("io.papermc.paper.network.ChannelInitializeListenerHolder");
+        Class<?> keyType      = Class.forName("net.kyori.adventure.key.Key");
+        Class<?> listenerType = Class.forName("io.papermc.paper.network.ChannelInitializeListener");
+
+        Object listener = Proxy.newProxyInstance(
+                listenerType.getClassLoader(),
+                new Class<?>[]{listenerType},
+                (proxy, method, args) -> switch (method.getName()) {
+                    case "afterInitChannel" -> {
+                        attachInterceptor((Channel) args[0]);
+                        yield null;
+                    }
+                    case "hashCode" -> System.identityHashCode(proxy);
+                    case "equals"   -> proxy == args[0];
+                    case "toString" -> "LOM-ChannelInitializeListener";
+                    default         -> null;
+                });
+
+        holder.getMethod("addListener", keyType, listenerType)
+              .invoke(null, adventureKey(), listener);
+    }
+
+    /** Builds {@code Key.key("limitedofflinemode", LISTENER_KEY)} without a compile-time adventure dep. */
+    private Object adventureKey() throws Exception {
+        Class<?> keyType = Class.forName("net.kyori.adventure.key.Key");
+        return keyType.getMethod("key", String.class, String.class)
+                      .invoke(null, getName().toLowerCase(Locale.ROOT), LISTENER_KEY);
+    }
+
+    /** Adds the login interceptor ahead of Minecraft's own packet handler, once. */
+    private void attachInterceptor(Channel ch) {
+        if (ch.pipeline().get("packet_handler") == null || ch.pipeline().get(HANDLER_KEY) != null) {
+            return;
+        }
+        ch.pipeline().addBefore("packet_handler", HANDLER_KEY, new LoginInterceptor(this));
     }
 
     private void setupSpigotInjection() throws Exception {
         Object craftServer    = Bukkit.getServer();
         Object minecraftServer = craftServer.getClass().getMethod("getServer").invoke(craftServer);
 
-        Object serverConnection = findFieldByTypeName(minecraftServer, "ServerConnection");
+        Object serverConnection = findServerConnection(minecraftServer);
         if (serverConnection == null) {
-            throw new IllegalStateException("Cannot find ServerConnection on MinecraftServer");
+            throw new IllegalStateException("Cannot find ServerConnection/ServerConnectionListener on "
+                    + minecraftServer.getClass().getName());
         }
 
         List<ChannelFuture> futures = findChannelFutures(serverConnection);
@@ -127,8 +165,18 @@ public class LimitedOfflineModePaper extends JavaPlugin {
             throw new IllegalStateException("Cannot find ChannelFuture list in ServerConnection");
         }
 
-        LimitedOfflineModePaper plugin = this;
-        ChannelInboundHandlerAdapter serverHandler = new ChannelInboundHandlerAdapter() {
+        // A fresh handler per bind future — ChannelInboundHandlerAdapter is not @Sharable,
+        // and the server binds separate channels for IPv4/IPv6.
+        for (ChannelFuture future : futures) {
+            Channel serverChannel = future.channel();
+            serverChannel.pipeline().addFirst(SERVER_HANDLER_KEY, newServerHandler());
+            injectedServerChannels.add(serverChannel);
+        }
+    }
+
+    /** Accepts each incoming child channel and queues the interceptor onto it. */
+    private ChannelInboundHandlerAdapter newServerHandler() {
+        return new ChannelInboundHandlerAdapter() {
             @Override
             public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
                 if (msg instanceof Channel playerChannel) {
@@ -137,11 +185,7 @@ public class LimitedOfflineModePaper extends JavaPlugin {
                         protected void initChannel(Channel ch) {
                             // Defer until after Minecraft's own ChannelInitializer sets up packet_handler
                             ch.eventLoop().execute(() -> {
-                                if (ch.isActive()
-                                        && ch.pipeline().get("packet_handler") != null
-                                        && ch.pipeline().get(HANDLER_KEY) == null) {
-                                    ch.pipeline().addBefore("packet_handler", HANDLER_KEY, new LoginInterceptor(plugin));
-                                }
+                                if (ch.isActive()) attachInterceptor(ch);
                             });
                         }
                     });
@@ -149,23 +193,31 @@ public class LimitedOfflineModePaper extends JavaPlugin {
                 super.channelRead(ctx, msg);
             }
         };
-
-        for (ChannelFuture future : futures) {
-            Channel serverChannel = future.channel();
-            serverChannel.pipeline().addFirst(SERVER_HANDLER_KEY, serverHandler);
-            injectedServerChannels.add(serverChannel);
-        }
     }
 
     // ── Reflection helpers for Spigot injection ───────────────────────────────
 
-    private static Object findFieldByTypeName(Object obj, String simpleTypeName) {
-        Class<?> clazz = obj.getClass();
+    /**
+     * Mojang-mapped builds call this {@code ServerConnectionListener} (field {@code connection});
+     * older Spigot/obfuscated builds call it {@code ServerConnection}. Try the accessor first,
+     * then any field whose type name starts with "ServerConnection".
+     */
+    private static Object findServerConnection(Object minecraftServer) {
+        for (String accessor : new String[]{"getConnection", "connection", "getServerConnection"}) {
+            try {
+                Object val = minecraftServer.getClass().getMethod(accessor).invoke(minecraftServer);
+                if (val != null && val.getClass().getSimpleName().startsWith("ServerConnection")) return val;
+            } catch (Exception ignored) {}
+        }
+        Class<?> clazz = minecraftServer.getClass();
         while (clazz != null) {
             for (Field f : clazz.getDeclaredFields()) {
-                if (f.getType().getSimpleName().equals(simpleTypeName)) {
+                if (f.getType().getSimpleName().startsWith("ServerConnection")) {
                     f.setAccessible(true);
-                    try { return f.get(obj); } catch (Exception ignored) {}
+                    try {
+                        Object val = f.get(minecraftServer);
+                        if (val != null) return val;
+                    } catch (Exception ignored) {}
                 }
             }
             clazz = clazz.getSuperclass();
